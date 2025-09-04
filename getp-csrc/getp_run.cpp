@@ -209,19 +209,20 @@ __global__ void k_softmax_row(float *att, int row_len) {
 // (10) weighted sum over V cache → tb (per head)
 __global__ void k_attn_weighted_sum(const float *att, const float *v_cache,
                                     float *tb, int head_dim, int kv_mul,
-                                    int seq_len, int pos, int kv_dim,
+                                    int row_stride, int row_len, int kv_dim,
                                     int n_heads) {
   int h = blockIdx.x;          // head
   int i = threadIdx.x;         // dim element
   if (h >= n_heads || i >= head_dim) return;
 
   float out = 0.f;
-  for (int t=0; t<=pos; ++t) {
-    const float a = att[h*(seq_len+1) + t];
-    const float *vt = v_cache + t*kv_dim + (h/kv_mul)*head_dim;
+  // row_len == pos+2 (tokens 0..pos plus sink)
+  for (int t = 0; t < row_len; ++t) {
+    const float a = att[(size_t)h * row_stride + t];
+    const float *vt = v_cache + (size_t)t * kv_dim + (size_t)(h / kv_mul) * head_dim;
     out += a * vt[i];
   }
-  tb[h*head_dim + i] = out;
+  tb[(size_t)h * head_dim + i] = out;
 }
 
 // (11) elementwise: gate_up (SwiGLU + clamp + extra bias 1.0 on up)
@@ -344,12 +345,13 @@ static void softmax_rows_gpu(float *att, int n_heads, int row_len, int row_strid
 static void attn_weighted_sum_gpu(const float *att, const float *v_cache,
                                   float *tb, int head_dim, int kv_mul,
                                   int seq_len, int pos, int kv_dim, int n_heads) {
-  int row_len = pos + 2;           
-  int row_stride = seq_len + 1;
-  dim3 grid(n_heads), block(head_dim);
+  int row_len = pos + 2;           // include sink
+  int row_stride = seq_len + 1;    // physical stride used when storing att
+  dim3 grid(n_heads);
+  dim3 block((unsigned)head_dim);
   hipLaunchKernelGGL(k_attn_weighted_sum, grid, block, 0, 0,
                      att, v_cache, tb, head_dim, kv_mul,
-                     row_stride, pos, kv_dim, n_heads);
+                     row_stride, row_len, kv_dim, n_heads);
 }
 
 static void swiglu_gpu(float *gate, float *up, float *out,
@@ -511,19 +513,19 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
   to_device(&w->b_router, ptr, 1ll * n_layers * n_experts * sizeof(float));
   ptr += 1ll * n_layers * n_experts;
   // hey it's gate_upgate_up, not gategateupup
-  to_device(&w->w_mlp1, ptr,
-            1ll * n_layers * n_experts * cfg->hidden_dim * 2 * cfg->intermediate_dim *
-            sizeof(float));
-  ptr +=
-      1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
-  to_device(&w->b_mlp1, ptr, 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * sizeof(float));
-  ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
-  to_device(&w->w_mlp2, ptr,
-            1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim *
-            sizeof(float));
-  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
-  to_device(&w->b_mlp2, ptr, 1ll * n_layers * n_experts * cfg->hidden_dim * sizeof(float));
-  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
+  // to_device(&w->w_mlp1, ptr,
+  //           1ll * n_layers * n_experts * cfg->hidden_dim * 2 * cfg->intermediate_dim *
+  //           sizeof(float));
+  // ptr +=
+  //     1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+  // to_device(&w->b_mlp1, ptr, 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * sizeof(float));
+  // ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
+  // to_device(&w->w_mlp2, ptr,
+  //           1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim *
+  //           sizeof(float));
+  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
+  // to_device(&w->b_mlp2, ptr, 1ll * n_layers * n_experts * cfg->hidden_dim * sizeof(float));
+  // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
 void load_checkpoint_gpu(char *ckpt, Config *config, TransformerWeights *weights,
@@ -620,6 +622,226 @@ static void malloc_state_gpu(Transformer *T) {
   }
 }
 
+// ---------- Multi-GPU MoE infra (add to getp_run.cpp) ----------
+// Place after your existing helpers/kernels, before build_transformer_gpu/forward_gpu.
+
+static int MOE_NGPUS = 0;           // number of devices used for expert parallelism
+static int MOE_GROUP_SIZE = 0;      // experts per device (n_experts / MOE_NGPUS)
+
+// per-device pointers for MoE shards and per-device RunState
+static float **MOE_dev_w_mlp1 = nullptr;
+static float **MOE_dev_w_mlp2 = nullptr;
+static float **MOE_dev_b_mlp1 = nullptr;
+static float **MOE_dev_b_mlp2 = nullptr;
+static RunState *MOE_dev_state = nullptr;      // host-side array of RunState (each entry holds device pointers)
+static float **MOE_partial_on_dev0 = nullptr;   // device-0 pointers for partial results (one per device)
+
+// Helper: allocate RunState fields on a given device (uses alloc_device helper already in file)
+// note: call hipSetDevice(dev) before calling this function
+static void alloc_runstate_on_device(RunState &s, const Config &c) {
+  alloc_device(&s.x,        c.hidden_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.t,        c.hidden_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.tb,       c.head_dim*c.n_attn_heads*sizeof(float), 0.f, true);
+  alloc_device(&s.tb2,      c.hidden_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.router_score,   c.n_experts*sizeof(float), 0.f, true);
+  HIP_CHECK(hipMalloc((void**)&s.topk_v, c.experts_per_token*sizeof(float)));
+  HIP_CHECK(hipMalloc((void**)&s.topk_i, c.experts_per_token*sizeof(int)));
+  alloc_device(&s.mlp1_out, 2*c.intermediate_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.gate,     c.intermediate_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.up,       c.intermediate_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.gate_up,  c.intermediate_dim*sizeof(float), 0.f, true);
+  alloc_device(&s.e_agg,    c.hidden_dim*sizeof(float), 0.f, true);
+
+  int qkv_tot = c.head_dim*(c.n_attn_heads + 2*c.n_kv_heads);
+  alloc_device(&s.qkv,    qkv_tot*sizeof(float), 0.f, true);
+  alloc_device(&s.q,      c.head_dim*c.n_attn_heads*sizeof(float), 0.f, true);
+  alloc_device(&s.att,    (c.n_attn_heads*(c.seq_len+1))*sizeof(float), 0.f, true);
+  alloc_device(&s.logits, c.vocab_size*sizeof(float), 0.f, true);
+
+  int kv_dim = c.head_dim * c.n_kv_heads;
+  size_t cache_elems = 1ll*c.n_layers*c.seq_len*kv_dim;
+  alloc_device(&s.key_cache,   cache_elems*sizeof(float), 0.f, true);
+  alloc_device(&s.value_cache, cache_elems*sizeof(float), 0.f, true);
+
+  if (c.sliding_window > 0) {
+    alloc_device(&s.mask, 1ll*c.seq_len*c.seq_len*sizeof(float), 0.f, true);
+    // initialize mask same as device 0 code: caller should copy host mask into this device mask if needed.
+    float *hmask = (float*)malloc(1ll*c.seq_len*c.seq_len*sizeof(float));
+    for (int i=0;i<c.seq_len;i++) for (int j=0;j<c.seq_len;j++) {
+      float v = 0.f;
+      if (c.sliding_window > 0 && i - j >= c.sliding_window) v = -INFINITY;
+      hmask[i*c.seq_len + j] = v;
+    }
+    HIP_CHECK(hipMemcpy(s.mask, hmask, 1ll*c.seq_len*c.seq_len*sizeof(float), hipMemcpyHostToDevice));
+    free(hmask);
+  } else {
+    s.mask = nullptr;
+  }
+}
+
+// Helper: free RunState fields (call with hipSetDevice(dev) to free device-side memory)
+static void free_runstate_on_device(RunState &s) {
+  auto F = [&](float *&p){ if (p){ hipFree(p); p=nullptr; } };
+  if (s.topk_v) hipFree(s.topk_v);
+  if (s.topk_i) hipFree(s.topk_i);
+  F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router_score); F(s.mlp1_out);
+  F(s.gate); F(s.up); F(s.gate_up); F(s.e_agg);
+  F(s.qkv); F(s.q); F(s.att); F(s.logits); F(s.key_cache); F(s.value_cache);
+  if (s.mask) { hipFree(s.mask); s.mask = nullptr; }
+}
+
+// Initialize MoE multi-GPU, scatter MoE weights from host-mapped checkpoint and allocate per-device state.
+// Call this after load_checkpoint_gpu(...) and after malloc_state_gpu(T) so T->data (host mmap) exists.
+static void init_moe_gpu(Transformer *T, int requested_ngpus = 0) {
+  const Config &c = T->config;
+  int available = 0;
+  HIP_CHECK(hipGetDeviceCount(&available));
+  // pick how many GPUs to use for expert parallelism
+  int ng = (requested_ngpus > 0 && requested_ngpus <= available) ? requested_ngpus : available;
+  if (ng <= 1) {
+    MOE_NGPUS = 1;
+    MOE_GROUP_SIZE = c.n_experts;
+    return;
+  }
+  MOE_NGPUS = ng;
+  MOE_GROUP_SIZE = c.n_experts / MOE_NGPUS;
+  if (MOE_GROUP_SIZE * MOE_NGPUS != c.n_experts) {
+    fprintf(stderr, "MOE partitioning requires n_experts divisible by ngpus\n");
+    exit(1);
+  }
+
+  // allocate arrays
+  MOE_dev_w_mlp1 = (float**)malloc(sizeof(float*) * MOE_NGPUS);
+  MOE_dev_w_mlp2 = (float**)malloc(sizeof(float*) * MOE_NGPUS);
+  MOE_dev_b_mlp1 = (float**)malloc(sizeof(float*) * MOE_NGPUS);
+  MOE_dev_b_mlp2 = (float**)malloc(sizeof(float*) * MOE_NGPUS);
+  MOE_partial_on_dev0 = (float**)malloc(sizeof(float*) * MOE_NGPUS);
+  MOE_dev_state = (RunState*)malloc(sizeof(RunState) * MOE_NGPUS);
+  memset(MOE_dev_state, 0, sizeof(RunState) * MOE_NGPUS);
+
+  // compute host base pointer for MoE weights inside the mmap'd file:
+  float *host_base = nullptr;
+  if (T->data == nullptr) {
+    fprintf(stderr, "init_moe_gpu: T->data (host mmap) is null - cannot scatter weights\n");
+    exit(1);
+  }
+  host_base = T->data + sizeof(Config)/sizeof(float);
+  float *ptr = host_base;
+
+  // Walk offsets in same order as memory_map_weights_gpu to reach w_mlp1,b_mlp1,w_mlp2,b_mlp2
+  ptr += 1ll * c.vocab_size * c.hidden_dim; // token_embedding_table
+  ptr += 1ll * c.vocab_size * c.hidden_dim; // out
+  ptr += 1ll * c.n_layers * c.hidden_dim;   // rms_attn_w
+  ptr += 1ll * c.n_layers * c.hidden_dim;   // rms_ffn_w
+  ptr += 1ll * c.hidden_dim;                // rms_out_w
+  ptr += 1ll * c.n_layers * c.hidden_dim * (c.head_dim * c.n_attn_heads + 2 * c.head_dim * c.n_kv_heads); // w_qkv
+  ptr += 1ll * c.n_layers * (c.head_dim * c.n_attn_heads + 2 * c.head_dim * c.n_kv_heads); // b_qkv
+  ptr += 1ll * c.n_layers * (c.head_dim * c.n_attn_heads) * c.hidden_dim; // w_o
+  ptr += 1ll * c.n_layers * c.hidden_dim; // b_o
+  ptr += 1ll * c.n_layers * c.n_attn_heads; // attn_sinks
+  ptr += 1ll * c.n_layers * c.hidden_dim * c.n_experts; // w_router
+  ptr += 1ll * c.n_layers * c.n_experts; // b_router
+
+  // Now ptr points to start of w_mlp1
+  float *host_w_mlp1 = ptr;
+  size_t mlp1_per_expert = (size_t)2 * c.intermediate_dim * c.hidden_dim;
+  ptr += 1ll * c.n_layers * c.n_experts * mlp1_per_expert;
+
+  float *host_b_mlp1 = ptr;
+  ptr += 1ll * c.n_layers * c.n_experts * (size_t)(2 * c.intermediate_dim);
+
+  float *host_w_mlp2 = ptr;
+  size_t mlp2_per_expert = (size_t)c.hidden_dim * c.intermediate_dim;
+  ptr += 1ll * c.n_layers * c.n_experts * mlp2_per_expert;
+
+  float *host_b_mlp2 = ptr;
+  ptr += 1ll * c.n_layers * c.n_experts * (size_t)c.hidden_dim;
+
+  // Now scatter per-device
+  size_t dev_mlp1_elems_per_layer = (size_t)MOE_GROUP_SIZE * mlp1_per_expert;
+  size_t dev_mlp2_elems_per_layer = (size_t)MOE_GROUP_SIZE * mlp2_per_expert;
+  size_t dev_b1_elems_per_layer = (size_t)MOE_GROUP_SIZE * (2 * c.intermediate_dim);
+  size_t dev_b2_elems_per_layer = (size_t)MOE_GROUP_SIZE * c.hidden_dim;
+
+  for (int d=0; d<MOE_NGPUS; ++d) {
+    HIP_CHECK(hipSetDevice(d));
+    // allocate device-local shard buffers sized for all layers
+    size_t dev_mlp1_total = (size_t)c.n_layers * dev_mlp1_elems_per_layer;
+    size_t dev_b1_total   = (size_t)c.n_layers * dev_b1_elems_per_layer;
+    size_t dev_mlp2_total = (size_t)c.n_layers * dev_mlp2_elems_per_layer;
+    size_t dev_b2_total   = (size_t)c.n_layers * dev_b2_elems_per_layer;
+
+    HIP_CHECK( hipMalloc((void**)&MOE_dev_w_mlp1[d], dev_mlp1_total * sizeof(float)) );
+    HIP_CHECK( hipMalloc((void**)&MOE_dev_b_mlp1[d], dev_b1_total * sizeof(float)) );
+    HIP_CHECK( hipMalloc((void**)&MOE_dev_w_mlp2[d], dev_mlp2_total * sizeof(float)) );
+    HIP_CHECK( hipMalloc((void**)&MOE_dev_b_mlp2[d], dev_b2_total * sizeof(float)) );
+
+    // copy per-layer slices from host into this device's contiguous buffer
+    for (int l=0; l<c.n_layers; ++l) {
+      float *h_slice_w1 = host_w_mlp1 + (size_t)l * c.n_experts * mlp1_per_expert
+                               + (size_t)d * MOE_GROUP_SIZE * mlp1_per_expert;
+      float *dst_w1 = MOE_dev_w_mlp1[d] + (size_t)l * dev_mlp1_elems_per_layer;
+      HIP_CHECK( hipMemcpy(dst_w1, h_slice_w1, dev_mlp1_elems_per_layer * sizeof(float), hipMemcpyHostToDevice) );
+
+      float *h_slice_b1 = host_b_mlp1 + (size_t)l * c.n_experts * (2 * c.intermediate_dim)
+                               + (size_t)d * MOE_GROUP_SIZE * (2 * c.intermediate_dim);
+      float *dst_b1 = MOE_dev_b_mlp1[d] + (size_t)l * dev_b1_elems_per_layer;
+      HIP_CHECK( hipMemcpy(dst_b1, h_slice_b1, dev_b1_elems_per_layer * sizeof(float), hipMemcpyHostToDevice) );
+
+      float *h_slice_w2 = host_w_mlp2 + (size_t)l * c.n_experts * mlp2_per_expert
+                               + (size_t)d * MOE_GROUP_SIZE * mlp2_per_expert;
+      float *dst_w2 = MOE_dev_w_mlp2[d] + (size_t)l * dev_mlp2_elems_per_layer;
+      HIP_CHECK( hipMemcpy(dst_w2, h_slice_w2, dev_mlp2_elems_per_layer * sizeof(float), hipMemcpyHostToDevice) );
+
+      float *h_slice_b2 = host_b_mlp2 + (size_t)l * c.n_experts * c.hidden_dim
+                               + (size_t)d * MOE_GROUP_SIZE * c.hidden_dim;
+      float *dst_b2 = MOE_dev_b_mlp2[d] + (size_t)l * dev_b2_elems_per_layer;
+      HIP_CHECK( hipMemcpy(dst_b2, h_slice_b2, dev_b2_elems_per_layer * sizeof(float), hipMemcpyHostToDevice) );
+    }
+
+    // allocate partial result buffer on device 0 (host-visible) for gathering; allocate on device 0
+    HIP_CHECK(hipSetDevice(0));
+    HIP_CHECK( hipMalloc((void**)&MOE_partial_on_dev0[d], c.hidden_dim * sizeof(float)) );
+
+    // allocate per-device RunState
+    HIP_CHECK(hipSetDevice(d));
+    alloc_runstate_on_device(MOE_dev_state[d], c);
+  }
+
+  // note: we keep device0's full T->weights*(all) untouched; the MoE shards additionally exist on each device.
+  // Optionally we could free the full-device copy of MoE weights on device0 to save memory if necessary.
+}
+
+// cleanup
+static void free_moe_gpu(Transformer *T) {
+  const Config &c = T->config;
+  if (MOE_NGPUS <= 1) return;
+  for (int d=0; d<MOE_NGPUS; ++d) {
+    // free per-device shards
+    HIP_CHECK( hipSetDevice(d) );
+    if (MOE_dev_w_mlp1 && MOE_dev_w_mlp1[d]) hipFree(MOE_dev_w_mlp1[d]);
+    if (MOE_dev_w_mlp2 && MOE_dev_w_mlp2[d]) hipFree(MOE_dev_w_mlp2[d]);
+    if (MOE_dev_b_mlp1 && MOE_dev_b_mlp1[d]) hipFree(MOE_dev_b_mlp1[d]);
+    if (MOE_dev_b_mlp2 && MOE_dev_b_mlp2[d]) hipFree(MOE_dev_b_mlp2[d]);
+    // free per-device RunState
+    free_runstate_on_device(MOE_dev_state[d]);
+    // free partial buffers on device 0
+    HIP_CHECK( hipSetDevice(0) );
+    if (MOE_partial_on_dev0 && MOE_partial_on_dev0[d]) hipFree(MOE_partial_on_dev0[d]);
+  }
+  if (MOE_dev_w_mlp1) free(MOE_dev_w_mlp1);
+  if (MOE_dev_w_mlp2) free(MOE_dev_w_mlp2);
+  if (MOE_dev_b_mlp1) free(MOE_dev_b_mlp1);
+  if (MOE_dev_b_mlp2) free(MOE_dev_b_mlp2);
+  if (MOE_partial_on_dev0) free(MOE_partial_on_dev0);
+  if (MOE_dev_state) free(MOE_dev_state);
+
+  MOE_dev_w_mlp1 = MOE_dev_w_mlp2 = MOE_dev_b_mlp1 = MOE_dev_b_mlp2 = nullptr;
+  MOE_partial_on_dev0 = nullptr;
+  MOE_dev_state = nullptr;
+  MOE_NGPUS = 0; MOE_GROUP_SIZE = 0;
+}
+
 // ------------------------------ I/O helpers ------------------------------
 
 static void free_transformer_gpu(Transformer *T) {
@@ -627,6 +849,7 @@ static void free_transformer_gpu(Transformer *T) {
   if (T->fd!=-1) close(T->fd);
 
   // free device weights/state
+  free_moe_gpu(T); // free MoE multi-GPU infra if any
   TransformerWeights &g = T->weights;
   auto F=[&](float *&p){ if(p){ hipFree(p); p=nullptr; } };
   F(g.token_embedding_table); F(g.rms_attn_w); F(g.rms_ffn_w); F(g.w_qkv); F(g.w_o);
@@ -642,9 +865,10 @@ static void free_transformer_gpu(Transformer *T) {
 
 static void build_transformer_gpu(Transformer *T, char *ckpt) {
   T->fd = -1; T->data = nullptr; T->file_size = 0;
-  hipSetDevice(0); // MI250 GCD0
+  // hipSetDevice(0); // MI250 GCD0
   load_checkpoint_gpu(ckpt, &T->config, &T->weights, &T->fd, &T->data, &T->file_size);
   malloc_state_gpu(T);
+  init_moe_gpu(T, 4); // use 4 GPUs for MoE expert parallelism
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
@@ -654,7 +878,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  char *checkpoint_path = "model.bin"; // e.g. out/model.bin
+  char *checkpoint_path = "/nfs/gpu_trainee/final-project/modelbin/gpt-oss-20b.bin"; // e.g. out/model.bin
   const char *tokenizer_path = "tokenizer.bin";
 
   build_transformer_gpu(transformer, checkpoint_path);
@@ -776,7 +1000,7 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
     topk_host(h_topk_v, h_topk_i, h_router, p.n_experts, p.experts_per_token);
     HIP_CHECK(hipMemcpy(s.topk_v, h_topk_v, p.experts_per_token*sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(s.topk_i, h_topk_i, p.experts_per_token*sizeof(int),   hipMemcpyHostToDevice));
-    free(h_router); free(h_topk_v); free(h_topk_i);
+    free(h_router);
 
     // e_agg = 0
     {
@@ -784,43 +1008,131 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, s.e_agg, 0.f, H);
     }
 
-    // For each selected expert e:
-    for (int idx=0; idx<p.experts_per_token; ++idx) {
-      int e;
-      HIP_CHECK(hipMemcpy(&e, s.topk_i+idx, sizeof(int), hipMemcpyDeviceToHost));
-      float wexp;
-      HIP_CHECK(hipMemcpy(&wexp, s.topk_v+idx, sizeof(float), hipMemcpyDeviceToHost));
+    // Host copies of topk (we had them as h_topk_v/h_topk_i earlier)
+    // HIP_CHECK(hipMemcpy(h_topk_v, s.topk_v, p.experts_per_token*sizeof(float), hipMemcpyDeviceToHost));
+    // HIP_CHECK(hipMemcpy(h_topk_i, s.topk_i, p.experts_per_token*sizeof(int),   hipMemcpyDeviceToHost));
 
-      // MLP1: mlp1_out = W_mlp1[l,e] * t + b_mlp1[l,e] → size 2*intermediate
-      const float *W1 = w.w_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
-      const float *B1 = w.b_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim);
-      gemv_gpu(s.mlp1_out, s.t, W1, H, 2*p.intermediate_dim);
-      add_bias_gpu(s.mlp1_out, B1, 2*p.intermediate_dim);
+    if (MOE_NGPUS <= 1) {
+      // single-device path (original)
+      for (int idx=0; idx<p.experts_per_token; ++idx) {
+        int e = h_topk_i[idx];
+        float wexp = h_topk_v[idx];
 
-      // split into gate/up (strided memcopy on device is okay via kernels, but here do 2 gemv-free copies)
-      HIP_CHECK(hipMemcpy2D(s.gate, sizeof(float),
-                            s.mlp1_out, sizeof(float)*2,
-                            sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
-      HIP_CHECK(hipMemcpy2D(s.up, sizeof(float),
-                            s.mlp1_out+1, sizeof(float)*2,
-                            sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+        const float *W1 = w.w_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
+        const float *B1 = w.b_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim);
+        gemv_gpu(s.mlp1_out, s.t, W1, H, 2*p.intermediate_dim);
+        add_bias_gpu(s.mlp1_out, B1, 2*p.intermediate_dim);
 
-      // SwiGLU + clamp → gate_up
-      swiglu_gpu(s.gate, s.up, s.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
+        HIP_CHECK(hipMemcpy2D(s.gate, sizeof(float),
+                              s.mlp1_out, sizeof(float)*2,
+                              sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpy2D(s.up, sizeof(float),
+                              s.mlp1_out+1, sizeof(float)*2,
+                              sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
 
-      // MLP2: tb2 = W_mlp2[l,e] * gate_up + b_mlp2[l,e] → size hidden
-      const float *W2 = w.w_mlp2 + (size_t)(l*p.n_experts + e) * H * p.intermediate_dim;
-      const float *B2 = w.b_mlp2 + (size_t)(l*p.n_experts + e) * H;
-      gemv_gpu(s.tb2, s.gate_up, W2, p.intermediate_dim, H);
-      add_bias_gpu(s.tb2, B2, H);
+        swiglu_gpu(s.gate, s.up, s.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
 
-      // e_agg += tb2 * wexp
-      axpy_gpu(s.e_agg, s.tb2, wexp, H);
-    }
+        const float *W2 = w.w_mlp2 + (size_t)(l*p.n_experts + e) * H * p.intermediate_dim;
+        const float *B2 = w.b_mlp2 + (size_t)(l*p.n_experts + e) * H;
+        gemv_gpu(s.tb2, s.gate_up, W2, p.intermediate_dim, H);
+        add_bias_gpu(s.tb2, B2, H);
+
+        axpy_gpu(s.e_agg, s.tb2, wexp, H);
+      }
+    } else {
+      // multi-device expert-parallel path:
+      // 1) stage s.t (input) to host once, then copy to each device's RunState.t and topk arrays
+      float *h_t = (float*)malloc(H * sizeof(float));
+      HIP_CHECK(hipMemcpy(h_t, s.t, H * sizeof(float), hipMemcpyDeviceToHost));
+
+      // For each device, copy t and topk arrays into that device's RunState
+      for (int d=0; d<MOE_NGPUS; ++d) {
+        HIP_CHECK(hipSetDevice(d));
+        // copy t
+        HIP_CHECK(hipMemcpy(MOE_dev_state[d].t, h_t, H * sizeof(float), hipMemcpyHostToDevice));
+        // copy topk arrays (common to all devices)
+        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_v, h_topk_v, p.experts_per_token*sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_i, h_topk_i, p.experts_per_token*sizeof(int),   hipMemcpyHostToDevice));
+
+        // zero per-device e_agg
+        const int BS=256, GS=(H+BS-1)/BS;
+        hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, MOE_dev_state[d].e_agg, 0.f, H);
+      }
+
+      free(h_t);
+
+      // 2) compute experts assigned to each device in parallel (each device processes only its local experts)
+      // #pragma omp parallel for num_threads(MOE_NGPUS)
+      for (int d=0; d<MOE_NGPUS; ++d) {
+        HIP_CHECK(hipSetDevice(d));
+        RunState &ds = MOE_dev_state[d];
+
+        // local group base index
+        int group_base = d * MOE_GROUP_SIZE;
+        size_t mlp1_per = (size_t)2 * p.intermediate_dim * H;
+        size_t mlp2_per = (size_t)H * p.intermediate_dim;
+        size_t dev_mlp1_layer_stride = (size_t)MOE_GROUP_SIZE * mlp1_per;
+        size_t dev_mlp2_layer_stride = (size_t)MOE_GROUP_SIZE * mlp2_per;
+        size_t dev_b1_layer_stride   = (size_t)MOE_GROUP_SIZE * (2 * p.intermediate_dim);
+        size_t dev_b2_layer_stride   = (size_t)MOE_GROUP_SIZE * H;
+
+        // for each selected top-k entry, check whether it belongs to this device's group
+        for (int idx=0; idx<p.experts_per_token; ++idx) {
+          int e = h_topk_i[idx];
+          float wexp = h_topk_v[idx];
+          if (e < 0) continue;
+          int owner = e / MOE_GROUP_SIZE;
+          if (owner != d) continue;
+          int local_idx = e - group_base;
+          // pointers into device's shard
+          const float *W1_local = MOE_dev_w_mlp1[d] + (size_t)l * dev_mlp1_layer_stride + (size_t)local_idx * mlp1_per;
+          const float *B1_local = MOE_dev_b_mlp1[d] + (size_t)l * dev_b1_layer_stride + (size_t)local_idx * (2 * p.intermediate_dim);
+          // mlp1: mlp1_out = W1 * ds.t + b1
+          gemv_gpu(ds.mlp1_out, ds.t, W1_local, H, 2 * p.intermediate_dim);
+          add_bias_gpu(ds.mlp1_out, B1_local, 2 * p.intermediate_dim);
+
+          // split
+          HIP_CHECK(hipMemcpy2D(ds.gate, sizeof(float),
+                                ds.mlp1_out, sizeof(float)*2,
+                                sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+          HIP_CHECK(hipMemcpy2D(ds.up, sizeof(float),
+                                ds.mlp1_out+1, sizeof(float)*2,
+                                sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+
+          // SwiGLU
+          swiglu_gpu(ds.gate, ds.up, ds.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
+
+          // mlp2
+          const float *W2_local = MOE_dev_w_mlp2[d] + (size_t)l * dev_mlp2_layer_stride + (size_t)local_idx * mlp2_per;
+          const float *B2_local = MOE_dev_b_mlp2[d] + (size_t)l * dev_b2_layer_stride + (size_t)local_idx * H;
+          gemv_gpu(ds.tb2, ds.gate_up, W2_local, p.intermediate_dim, H);
+          add_bias_gpu(ds.tb2, B2_local, H);
+
+          // accumulate into local device e_agg
+          axpy_gpu(ds.e_agg, ds.tb2, wexp, H);
+        } // end idx loop
+
+        // after device computed its local e_agg, copy partial e_agg to device 0 partial buffer
+        // copy device d: ds.e_agg --> device 0: MOE_partial_on_dev0[d]
+        HIP_CHECK( hipMemcpyPeer(MOE_partial_on_dev0[d], 0, ds.e_agg, d, H * sizeof(float)) );
+      } // end parallel for
+
+      // 3) reduce partials on device 0: s.e_agg = sum_{d} partial_d
+      // zero s.e_agg first (already zeroed above), now accumulate per-device
+      for (int d=0; d<MOE_NGPUS; ++d) {
+        // elementwise add MOE_partial_on_dev0[d] into s.e_agg on device 0
+        HIP_CHECK(hipSetDevice(0));
+        // use axpy kernel to do s.e_agg += partial
+        axpy_gpu(s.e_agg, MOE_partial_on_dev0[d], 1.0f, H);
+      }
+    } // end multi-gpu MoE
+
+    free(h_topk_v);
+    free(h_topk_i);
 
     // residual: x += e_agg
     axpy_gpu(s.x, s.e_agg, 1.0f, H);
-  }
+  } // end layer loop
 
   // final rmsnorm
   rmsnorm_gpu(s.x, s.x, w.rms_out_w, H);
@@ -874,6 +1186,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
+    hipSetDevice(0);
     float *logits = forward_gpu(transformer, token, pos);
 
     // advance the state machine
