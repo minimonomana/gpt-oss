@@ -411,7 +411,7 @@ static void free_moe_gpu(Transformer *T) {
     if (MOE_dev_b_mlp1 && MOE_dev_b_mlp1[d]) hipFree(MOE_dev_b_mlp1[d]);
     if (MOE_dev_b_mlp2 && MOE_dev_b_mlp2[d]) hipFree(MOE_dev_b_mlp2[d]);
     // free per-device RunState
-    free_runstate_on_device(MOE_dev_state[d]);
+    // free_runstate_on_device(MOE_dev_state[d]);
     // free partial buffers on device 0
     HIP_CHECK( hipSetDevice(0) );
     if (MOE_partial_on_dev0 && MOE_partial_on_dev0[d]) hipFree(MOE_partial_on_dev0[d]);
@@ -443,11 +443,11 @@ static void free_transformer_gpu(Transformer *T) {
   F(g.b_qkv); F(g.b_o); F(g.attn_sinks); F(g.w_router); F(g.b_router);
   F(g.w_mlp1); F(g.w_mlp2); F(g.b_mlp1); F(g.b_mlp2); F(g.rms_out_w); F(g.out);
 
-  RunState &s = T->state;
-  F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router_score); if(s.topk_v) hipFree(s.topk_v);
-  if(s.topk_i) hipFree(s.topk_i); F(s.mlp1_out); F(s.gate); F(s.up); F(s.gate_up); F(s.e_agg);
-  F(s.qkv); F(s.q); F(s.att); F(s.logits); F(s.key_cache); F(s.value_cache);
-  if (s.mask) hipFree(s.mask);
+  // RunState &s = T->state;
+  // F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router_score); if(s.topk_v) hipFree(s.topk_v);
+  // if(s.topk_i) hipFree(s.topk_i); F(s.mlp1_out); F(s.gate); F(s.up); F(s.gate_up); F(s.e_agg);
+  // F(s.qkv); F(s.q); F(s.att); F(s.logits); F(s.key_cache); F(s.value_cache);
+  // if (s.mask) hipFree(s.mask);
 }
 
 static void build_transformer_gpu(Transformer *T, char *ckpt) {
@@ -455,7 +455,7 @@ static void build_transformer_gpu(Transformer *T, char *ckpt) {
   // hipSetDevice(0); // MI250 GCD0
   load_checkpoint_gpu(ckpt, &T->config, &T->weights, &T->fd, &T->data, &T->file_size);
   malloc_state_gpu(T);
-  init_moe_gpu(T, 4); // use 4 GPUs for MoE expert parallelism
+  init_moe_gpu(T, 2); // use 4 GPUs for MoE expert parallelism
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
@@ -469,7 +469,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   const char *tokenizer_path = "tokenizer.bin";
 
   build_transformer_gpu(transformer, checkpoint_path);
-  read_tokenizer(tokenizer, tokenizer_path, transformer->config.vocab_size);
+  // read_tokenizer(tokenizer, tokenizer_path, transformer->config.vocab_size);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -480,7 +480,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Unload model
   // - ...
   free_transformer_gpu(transformer);
-  free_tokenizer(tokenizer);
+  // free_tokenizer(tokenizer);
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
@@ -550,9 +550,9 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
     // print the token as string, decode it with the Tokenizer object
     // should be removed
-    const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-    fflush(stdout);
+    // const char *piece = decode_piece(tokenizer, token, next);
+    // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+    // fflush(stdout);
 
     token = next;
   }

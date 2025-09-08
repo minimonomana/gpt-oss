@@ -62,7 +62,7 @@ static int sample_mult_gpu(float *p, int n, float coin) {
             return i;
         }
     }
-    free(h_p);
+    // free(h_p);
     return n - 1;
 }
 
@@ -97,7 +97,7 @@ static int sample_topp_gpu(float *p, int n, float topp, ProbIndex *probindex, fl
             return probindex[i].index;
         }
     }
-    free(h_p);
+    // free(h_p);
     return probindex[last_idx].index;
 }
 

@@ -14,8 +14,8 @@
 #include <string.h>
 
 #include "hip/rms_norm.cpp"
-#include "hip/softmax.cpp"
 #include "hip/matmul.cpp"
+#include "hip/softmax.cpp"
 #include "hip/add_bias.cpp"
 #include "hip/rope.cpp"
 #include "hip/attention.cpp"
@@ -67,41 +67,68 @@ static void split_qkv_gpu(const float *qkv, float *q, float *k, float *v,
                      head_dim, n_q, n_kv);
 }
 
-static void topk_gpu(float *h_topk_v, int *h_topk_i, const float *h_scores, int n, int k) {
-  // Allocate host buffers
-  // float *h_scores = (float*)malloc(n * sizeof(float));
-  // float *h_topk_v = (float*)malloc(k * sizeof(float));
-  // int   *h_topk_i = (int*)malloc(k * sizeof(int));
-
-  // Copy scores from device to host
-  // HIP_CHECK(hipMemcpy(h_scores, scores, n * sizeof(float), hipMemcpyDeviceToHost));
-
-  // Top-k selection (same as host version)
-  for (int i = 0; i < k; i++) { h_topk_v[i] = -INFINITY; h_topk_i[i] = -1; }
-  for (int e = 0; e < n; e++) {
-    float v = h_scores[e];
-    int slot = -1;
-    for (int i = 0; i < k; i++) if (v > h_topk_v[i]) { slot = i; break; }
-    if (slot >= 0) {
-      for (int j = k - 1; j > slot; j--) { h_topk_v[j] = h_topk_v[j - 1]; h_topk_i[j] = h_topk_i[j - 1]; }
-      h_topk_v[slot] = v; h_topk_i[slot] = e;
+__global__ void split_gate_up(const float *mlp1_out, float *gate, float *up, int intermediate_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < intermediate_dim) {
+        gate[i] = mlp1_out[i*2];
+        up[i]   = mlp1_out[i*2 + 1];
     }
-  }
+}
 
-  // Softmax normalize top-k (in-place)
-  float mx = h_topk_v[0];
-  for (int i = 1; i < k; i++) if (h_topk_v[i] > mx) mx = h_topk_v[i];
-  double sum = 0.0;
-  for (int i = 0; i < k; i++) { h_topk_v[i] = expf(h_topk_v[i] - mx); sum += h_topk_v[i]; }
-  for (int i = 0; i < k; i++) h_topk_v[i] /= (float)sum;
+__global__ void k_append_sink(float *att, const float *sinks, int seq_len, int pos_plus1, int n_heads) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h < n_heads) {
+        att[h * (seq_len + 1) + pos_plus1] = sinks[h];
+    }
+}
 
-  // Copy results back to device
-  // HIP_CHECK(hipMemcpy(topk_v, h_topk_v, k * sizeof(float), hipMemcpyHostToDevice));
-  // HIP_CHECK(hipMemcpy(topk_i, h_topk_i, k * sizeof(int), hipMemcpyHostToDevice));
+// Kernel to initialize Pair array from values
+__global__ void k_init_pairs(Pair *pairs, const float *values, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        pairs[i].value = values[i];
+        pairs[i].index = i;
+    }
+}
 
-  // free(h_scores);
-  // free(h_topk_v);
-  // free(h_topk_i);
+// Kernel to find top-k values and indices (simple selection, for small k)
+__global__ void k_topk(Pair *pairs, float *topk_values, int *topk_indices, int n, int k) {
+    // Only one thread does the selection (for small k)
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // Simple partial selection sort
+        for (int i = 0; i < k; ++i) {
+            int max_idx = i;
+            for (int j = i + 1; j < n; ++j) {
+                if (pairs[j].value > pairs[max_idx].value) {
+                    max_idx = j;
+                }
+            }
+            // Swap
+            if (max_idx != i) {
+                Pair tmp = pairs[i];
+                pairs[i] = pairs[max_idx];
+                pairs[max_idx] = tmp;
+            }
+            topk_values[i] = pairs[i].value;
+            topk_indices[i] = pairs[i].index;
+        }
+    }
+}
+
+// GPU topk function
+void topk_gpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
+    // Allocate device memory for pairs
+    Pair *d_pairs;
+    HIP_CHECK(hipMalloc(&d_pairs, num_experts * sizeof(Pair)));
+
+    // Initialize pairs on device
+    int BS = 256, GS = (num_experts + BS - 1) / BS;
+    hipLaunchKernelGGL(k_init_pairs, dim3(GS), dim3(BS), 0, 0, d_pairs, router_score, num_experts);
+
+    // Find top-k on device
+    hipLaunchKernelGGL(k_topk, dim3(1), dim3(1), 0, 0, d_pairs, topk_values, topk_indices, num_experts, experts_per_token);
+
+    HIP_CHECK(hipFree(d_pairs));
 }
 
 static float* forward_gpu(Transformer *T, int token, int pos) {
@@ -138,18 +165,12 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
     split_qkv_gpu(s.qkv, s.q, k_buf, v_buf, D, Hq, Hkv);
 
     // --- RoPE for q and k(pos)
-    // compute cos/sin on host (cheap) then upload temporary
     int half = D/2;
-    float *hcos = (float*)malloc(half*sizeof(float));
-    float *hsin = (float*)malloc(half*sizeof(float));
-    compute_cos_sin_host(pos, p.rope_theta, D, p.rope_scaling_factor,
-                         p.initial_context_length, 32.0f, 1.0f, hcos, hsin);
     float *dcos, *dsin;
-    HIP_CHECK(hipMalloc((void**)&dcos, half*sizeof(float)));
-    HIP_CHECK(hipMalloc((void**)&dsin, half*sizeof(float)));
-    HIP_CHECK(hipMemcpy(dcos, hcos, half*sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(dsin, hsin, half*sizeof(float), hipMemcpyHostToDevice));
-    free(hcos); free(hsin);
+    HIP_CHECK(hipMalloc(&dcos, half * sizeof(float)));
+    HIP_CHECK(hipMalloc(&dsin, half * sizeof(float)));
+    compute_cos_sin_gpu(pos, p.rope_theta, D, p.rope_scaling_factor,
+                        p.initial_context_length, 32.0f, 1.0f, dcos, dsin);
 
     rope_gpu(s.q, dcos, dsin, Hq, D);
     rope_gpu(k_buf, dcos, dsin, Hkv, D);
@@ -162,18 +183,13 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
                     D, kv_mul, p.seq_len, pos, kv_dim, Hq, (l%2==0)?p.sliding_window:0);
 
     // write sink score at index pos+1 (per head) from attn_sinks
-    // We'll do it from host by staging a small vector:
-    // step 1: copy att row for each head (pos+2 length) after kernel
-    // simpler: small kernelless copy from host:
-    float *h_sinks = (float*)malloc(Hq*sizeof(float));
-    HIP_CHECK(hipMemcpy(h_sinks, w.attn_sinks + (size_t)l*Hq, Hq*sizeof(float), hipMemcpyDeviceToHost));
-    // we just append sink value at [pos+1]
-    for (int h=0; h<Hq; ++h) {
-      float sinkv = h_sinks[h];
-      HIP_CHECK(hipMemcpy(s.att + h*(p.seq_len+1) + (pos+1),
-                          &sinkv, sizeof(float), hipMemcpyHostToDevice));
+    {
+      const int BS = 256, GS = (Hq + BS - 1) / BS;
+      const float *sink_ptr = w.attn_sinks + (size_t)l * Hq;
+      hipLaunchKernelGGL(k_append_sink, dim3(GS), dim3(BS), 0, 0,
+                        s.att, sink_ptr, p.seq_len, pos + 1, Hq);
+      HIP_CHECK(hipDeviceSynchronize());
     }
-    free(h_sinks);
 
     // softmax over len = pos+2 for each head
     softmax_rows_gpu(s.att, Hq, pos + 2, p.seq_len + 1);
@@ -200,15 +216,8 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
     add_bias_gpu(s.router_score, Br, p.n_experts);
     HIP_CHECK(hipDeviceSynchronize()); // ensure router on device finished
 
-    // Bring router to host → top-k selection on CPU (simple, correct)
-    float *h_router = (float*)malloc(p.n_experts*sizeof(float));
-    float *h_topk_v = (float*)malloc(p.experts_per_token*sizeof(float));
-    int   *h_topk_i = (int*)  malloc(p.experts_per_token*sizeof(int));
-    HIP_CHECK(hipMemcpy(h_router, s.router_score, p.n_experts*sizeof(float), hipMemcpyDeviceToHost));
-    topk_gpu(h_topk_v, h_topk_i, h_router, p.n_experts, p.experts_per_token);
-    HIP_CHECK(hipMemcpy(s.topk_v, h_topk_v, p.experts_per_token*sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(s.topk_i, h_topk_i, p.experts_per_token*sizeof(int),   hipMemcpyHostToDevice));
-    free(h_router);
+    topk_gpu(s.topk_v, s.topk_i, s.router_score, p.n_experts, p.experts_per_token);
+    softmax_rows_gpu(s.topk_v, 1, p.experts_per_token, p.experts_per_token); // normalize top-k values
 
     // e_agg = 0
     {
@@ -216,15 +225,11 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, s.e_agg, 0.f, H);
     }
 
-    // Host copies of topk (we had them as h_topk_v/h_topk_i earlier)
-    // HIP_CHECK(hipMemcpy(h_topk_v, s.topk_v, p.experts_per_token*sizeof(float), hipMemcpyDeviceToHost));
-    // HIP_CHECK(hipMemcpy(h_topk_i, s.topk_i, p.experts_per_token*sizeof(int),   hipMemcpyDeviceToHost));
-
     if (MOE_NGPUS <= 1) {
       // single-device path (original)
       for (int idx=0; idx<p.experts_per_token; ++idx) {
-        int e = h_topk_i[idx];
-        float wexp = h_topk_v[idx];
+        int e = s.topk_i[idx];
+        float wexp = s.topk_v[idx];
 
         const float *W1 = w.w_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
         const float *B1 = w.b_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim);
@@ -259,8 +264,8 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
         // copy t
         HIP_CHECK(hipMemcpy(MOE_dev_state[d].t, h_t, H * sizeof(float), hipMemcpyHostToDevice));
         // copy topk arrays (common to all devices)
-        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_v, h_topk_v, p.experts_per_token*sizeof(float), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_i, h_topk_i, p.experts_per_token*sizeof(int),   hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_v, s.topk_v, p.experts_per_token*sizeof(float), hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_i, s.topk_i, p.experts_per_token*sizeof(int),   hipMemcpyDeviceToDevice));
 
         // zero per-device e_agg
         const int BS=256, GS=(H+BS-1)/BS;
@@ -270,7 +275,7 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       free(h_t);
 
       // 2) compute experts assigned to each device in parallel (each device processes only its local experts)
-      // #pragma omp parallel for num_threads(MOE_NGPUS)
+      #pragma omp parallel for num_threads(MOE_NGPUS)
       for (int d=0; d<MOE_NGPUS; ++d) {
         HIP_CHECK(hipSetDevice(d));
         RunState &ds = MOE_dev_state[d];
@@ -286,8 +291,8 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
 
         // for each selected top-k entry, check whether it belongs to this device's group
         for (int idx=0; idx<p.experts_per_token; ++idx) {
-          int e = h_topk_i[idx];
-          float wexp = h_topk_v[idx];
+          int e = s.topk_i[idx];
+          float wexp = s.topk_v[idx];
           if (e < 0) continue;
           int owner = e / MOE_GROUP_SIZE;
           if (owner != d) continue;
@@ -300,12 +305,9 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
           add_bias_gpu(ds.mlp1_out, B1_local, 2 * p.intermediate_dim);
 
           // split
-          HIP_CHECK(hipMemcpy2D(ds.gate, sizeof(float),
-                                ds.mlp1_out, sizeof(float)*2,
-                                sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
-          HIP_CHECK(hipMemcpy2D(ds.up, sizeof(float),
-                                ds.mlp1_out+1, sizeof(float)*2,
-                                sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+          const int BS = 256, GS = (p.intermediate_dim + BS - 1) / BS;
+          hipLaunchKernelGGL(split_gate_up, dim3(GS), dim3(BS), 0, 0,
+                            ds.mlp1_out, ds.gate, ds.up, p.intermediate_dim);
 
           // SwiGLU
           swiglu_gpu(ds.gate, ds.up, ds.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
@@ -334,9 +336,6 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
         axpy_gpu(s.e_agg, MOE_partial_on_dev0[d], 1.0f, H);
       }
     } // end multi-gpu MoE
-
-    free(h_topk_v);
-    free(h_topk_i);
 
     // residual: x += e_agg
     axpy_gpu(s.x, s.e_agg, 1.0f, H);
