@@ -46,7 +46,7 @@ static int sample_argmax_gpu(const float *p, int n) {
     for (int i = 1; i < n; i++) {
         if (h_p[i] > mv) { mv = h_p[i]; m = i; }
     }
-    free(h_p);
+    // free(h_p);
     return m;
 }
 
@@ -58,7 +58,7 @@ static int sample_mult_gpu(float *p, int n, float coin) {
     for (int i = 0; i < n; i++) {
         cdf += h_p[i];
         if (coin < cdf) {
-            free(h_p);
+            // free(h_p);
             return i;
         }
     }
@@ -93,7 +93,7 @@ static int sample_topp_gpu(float *p, int n, float topp, ProbIndex *probindex, fl
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
         if (r < cdf) {
-            free(h_p);
+            // free(h_p);
             return probindex[i].index;
         }
     }

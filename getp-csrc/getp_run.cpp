@@ -115,55 +115,6 @@ void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
   // ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
-void load_checkpoint_gpu(char *ckpt, Config *config, TransformerWeights *weights,
-                     int *fd, float **data, ssize_t *file_size) {
-  FILE *file = fopen(ckpt, "rb");
-  if (!file) {
-    fprintf(stderr, "Couldn't open file %s\n", ckpt);
-    exit(EXIT_FAILURE);
-  }
-
-  // read in the config header
-  // load sizeof(Config) bytes into config
-  if (fread(config, sizeof(Config), 1, file) != 1) {
-    exit(EXIT_FAILURE);
-  }
-  // figure out the file size
-  // printf("vocab_size: %d\n", config->vocab_size);
-  // printf("hidden_dim: %d\n", config->hidden_dim);
-  // printf("n_experts: %d\n", config->n_experts);
-  // printf("experts_per_token: %d\n", config->experts_per_token);
-  // printf("intermediate_dim: %d\n", config->intermediate_dim);
-  // printf("n_layers: %d\n", config->n_layers);
-  // printf("head_dim: %d\n", config->head_dim);
-  // printf("n_attn_heads: %d\n", config->n_attn_heads);
-  // printf("n_kv_heads: %d\n", config->n_kv_heads);
-  // printf("max_seq_len: %d\n", config->seq_len);
-  // printf("init context len: %d\n", config->initial_context_length);
-  // printf("rope theta: %f\n", config->rope_theta);
-  // printf("rope_scaling_factor: %f\n", config->rope_scaling_factor);
-  // printf("sliding window: %d\n", config->sliding_window);
-  // printf("swiglu_limit: %f\n", config->swiglu_limit);
-  fseek(file, 0, SEEK_END); // move file pointer to end of file
-
-  *file_size = ftell(file); // get the file size, in bytes
-  fclose(file);
-  // memory map the Transformer weights into the data pointer
-  *fd = open(ckpt, O_RDONLY); // open in read only mode
-  if (*fd == -1) {
-    fprintf(stderr, "open failed\n");
-    exit(EXIT_FAILURE);
-  }
-  *data = reinterpret_cast<float *>(
-      mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
-  if (*data == MAP_FAILED) {
-    fprintf(stderr, "mmap failed!\n");
-    exit(EXIT_FAILURE);
-  }
-  float *weights_ptr = *data + sizeof(Config) / sizeof(float);
-  memory_map_weights_gpu(weights, config, weights_ptr);
-}
-
 static void malloc_state_gpu(Transformer *T) {
   const Config &c = T->config;
   RunState &s = T->state;
@@ -411,7 +362,7 @@ static void free_moe_gpu(Transformer *T) {
     if (MOE_dev_b_mlp1 && MOE_dev_b_mlp1[d]) hipFree(MOE_dev_b_mlp1[d]);
     if (MOE_dev_b_mlp2 && MOE_dev_b_mlp2[d]) hipFree(MOE_dev_b_mlp2[d]);
     // free per-device RunState
-    // free_runstate_on_device(MOE_dev_state[d]);
+    free_runstate_on_device(MOE_dev_state[d]);
     // free partial buffers on device 0
     HIP_CHECK( hipSetDevice(0) );
     if (MOE_partial_on_dev0 && MOE_partial_on_dev0[d]) hipFree(MOE_partial_on_dev0[d]);
@@ -432,8 +383,8 @@ static void free_moe_gpu(Transformer *T) {
 // ------------------------------ I/O helpers ------------------------------
 
 static void free_transformer_gpu(Transformer *T) {
-  if (T->data && T->data!=MAP_FAILED) munmap(T->data, T->file_size);
-  if (T->fd!=-1) close(T->fd);
+  // if (T->data && T->data!=MAP_FAILED) munmap(T->data, T->file_size);
+  // if (T->fd!=-1) close(T->fd);
 
   // free device weights/state
   free_moe_gpu(T); // free MoE multi-GPU infra if any
@@ -441,7 +392,8 @@ static void free_transformer_gpu(Transformer *T) {
   auto F=[&](float *&p){ if(p){ hipFree(p); p=nullptr; } };
   F(g.token_embedding_table); F(g.rms_attn_w); F(g.rms_ffn_w); F(g.w_qkv); F(g.w_o);
   F(g.b_qkv); F(g.b_o); F(g.attn_sinks); F(g.w_router); F(g.b_router);
-  F(g.w_mlp1); F(g.w_mlp2); F(g.b_mlp1); F(g.b_mlp2); F(g.rms_out_w); F(g.out);
+  // F(g.w_mlp1); F(g.w_mlp2); F(g.b_mlp1); F(g.b_mlp2); 
+  F(g.rms_out_w); F(g.out);
 
   // RunState &s = T->state;
   // F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router_score); if(s.topk_v) hipFree(s.topk_v);
@@ -450,13 +402,35 @@ static void free_transformer_gpu(Transformer *T) {
   // if (s.mask) hipFree(s.mask);
 }
 
-static void build_transformer_gpu(Transformer *T, char *ckpt) {
-  T->fd = -1; T->data = nullptr; T->file_size = 0;
+static void build_transformer_gpu(Transformer *T) {
+  // T->fd = -1; T->data = nullptr; T->file_size = 0;
   // hipSetDevice(0); // MI250 GCD0
-  load_checkpoint_gpu(ckpt, &T->config, &T->weights, &T->fd, &T->data, &T->file_size);
+  float *weights_ptr = T->data + sizeof(T->config) / sizeof(float);
+  memory_map_weights_gpu(&T->weights, &T->config, weights_ptr);
   malloc_state_gpu(T);
   init_moe_gpu(T, 2); // use 4 GPUs for MoE expert parallelism
 }
+
+void build_rope_tables(const Config& p, RopeTables &rt) {
+  hipSetDevice(0);
+    rt.max_seq = p.seq_len;
+    rt.head_dim = p.head_dim;
+    rt.half = p.head_dim / 2;
+
+    size_t rope_size = (size_t)rt.max_seq * rt.half;
+    HIP_CHECK(hipMalloc(&rt.dcos, rope_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&rt.dsin, rope_size * sizeof(float)));
+
+    dim3 block(256);
+    dim3 grid((rope_size + block.x - 1) / block.x);
+    k_precompute_rope<<<grid, block>>>(p.rope_theta, p.head_dim,
+                                       p.rope_scaling_factor, p.initial_context_length,
+                                       32.0f, 1.0f,
+                                       rt.max_seq, rt.dcos, rt.dsin);
+    HIP_CHECK(hipDeviceSynchronize());
+}
+
+RopeTables g_rope_tables;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -465,10 +439,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  char *checkpoint_path = "/nfs/gpu_trainee/final-project/modelbin/gpt-oss-20b.bin"; // e.g. out/model.bin
   const char *tokenizer_path = "tokenizer.bin";
 
-  build_transformer_gpu(transformer, checkpoint_path);
+  build_transformer_gpu(transformer);
+  build_rope_tables(transformer->config, g_rope_tables);
   // read_tokenizer(tokenizer, tokenizer_path, transformer->config.vocab_size);
 }
 
@@ -550,15 +524,15 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
     // print the token as string, decode it with the Tokenizer object
     // should be removed
-    // const char *piece = decode_piece(tokenizer, token, next);
-    // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-    // fflush(stdout);
+    const char *piece = decode_piece(tokenizer, token, next);
+    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+    fflush(stdout);
 
     token = next;
   }
 
   // should be removed
-  // printf("\n");
+  printf("\n");
 
   // Marker for end of sequence
   output_tokens[pos - num_prompt_tokens + 1] = -1;

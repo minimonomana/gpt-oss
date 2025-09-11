@@ -30,6 +30,7 @@ extern float **MOE_dev_b_mlp1;
 extern float **MOE_dev_b_mlp2;
 extern RunState *MOE_dev_state;
 extern float **MOE_partial_on_dev0;
+extern RopeTables g_rope_tables;
 
 #define HIP_CHECK(cmd) do { \
   hipError_t e = (cmd);     \
@@ -132,6 +133,7 @@ void topk_gpu(float *topk_values, int *topk_indices, const float *router_score, 
 }
 
 static float* forward_gpu(Transformer *T, int token, int pos) {
+  hipSetDevice(0);
   const Config &p = T->config;
   const TransformerWeights &w = T->weights;
   RunState &s = T->state;
@@ -160,21 +162,17 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
     add_bias_gpu(s.qkv, Bqkv, (D*Hq + 2*D*Hkv));
 
     // split to q,k,v. k/v current position also appended into cache
-    float *k_buf = T->state.key_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
-    float *v_buf = T->state.value_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
-    split_qkv_gpu(s.qkv, s.q, k_buf, v_buf, D, Hq, Hkv);
+    s.k = T->state.key_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
+    s.v = T->state.value_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
+    split_qkv_gpu(s.qkv, s.q, s.k, s.v, D, Hq, Hkv);
 
     // --- RoPE for q and k(pos)
     int half = D/2;
-    float *dcos, *dsin;
-    HIP_CHECK(hipMalloc(&dcos, half * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dsin, half * sizeof(float)));
-    compute_cos_sin_gpu(pos, p.rope_theta, D, p.rope_scaling_factor,
-                        p.initial_context_length, 32.0f, 1.0f, dcos, dsin);
-
+    const float *dcos = g_rope_tables.dcos + pos * half;
+    const float *dsin = g_rope_tables.dsin + pos * half;
     rope_gpu(s.q, dcos, dsin, Hq, D);
-    rope_gpu(k_buf, dcos, dsin, Hkv, D);
-    HIP_CHECK(hipFree(dcos)); HIP_CHECK(hipFree(dsin));
+    rope_gpu(s.k, dcos, dsin, Hkv, D);
+    // HIP_CHECK(hipFree(dcos)); HIP_CHECK(hipFree(dsin));
 
     // --- Attention scores for all heads vs 0..pos
     float *k_layer_cache = T->state.key_cache + (size_t)l*p.seq_len*kv_dim;
@@ -188,7 +186,7 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       const float *sink_ptr = w.attn_sinks + (size_t)l * Hq;
       hipLaunchKernelGGL(k_append_sink, dim3(GS), dim3(BS), 0, 0,
                         s.att, sink_ptr, p.seq_len, pos + 1, Hq);
-      HIP_CHECK(hipDeviceSynchronize());
+      // HIP_CHECK(hipDeviceSynchronize());
     }
 
     // softmax over len = pos+2 for each head
@@ -214,7 +212,7 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
     const float *Br = w.b_router + (size_t)l*p.n_experts;
     gemv_gpu(s.router_score, s.t, Wr, H, p.n_experts);
     add_bias_gpu(s.router_score, Br, p.n_experts);
-    HIP_CHECK(hipDeviceSynchronize()); // ensure router on device finished
+    // HIP_CHECK(hipDeviceSynchronize()); // ensure router on device finished
 
     topk_gpu(s.topk_v, s.topk_i, s.router_score, p.n_experts, p.experts_per_token);
     softmax_rows_gpu(s.topk_v, 1, p.experts_per_token, p.experts_per_token); // normalize top-k values
@@ -236,12 +234,9 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
         gemv_gpu(s.mlp1_out, s.t, W1, H, 2*p.intermediate_dim);
         add_bias_gpu(s.mlp1_out, B1, 2*p.intermediate_dim);
 
-        HIP_CHECK(hipMemcpy2D(s.gate, sizeof(float),
-                              s.mlp1_out, sizeof(float)*2,
-                              sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
-        HIP_CHECK(hipMemcpy2D(s.up, sizeof(float),
-                              s.mlp1_out+1, sizeof(float)*2,
-                              sizeof(float), p.intermediate_dim, hipMemcpyDeviceToDevice));
+        const int BS = 256, GS = (p.intermediate_dim + BS - 1) / BS;
+        hipLaunchKernelGGL(split_gate_up, dim3(GS), dim3(BS), 0, 0,
+                          s.mlp1_out, s.gate, s.up, p.intermediate_dim);
 
         swiglu_gpu(s.gate, s.up, s.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
 
@@ -254,25 +249,17 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       }
     } else {
       // multi-device expert-parallel path:
-      // 1) stage s.t (input) to host once, then copy to each device's RunState.t and topk arrays
-      float *h_t = (float*)malloc(H * sizeof(float));
-      HIP_CHECK(hipMemcpy(h_t, s.t, H * sizeof(float), hipMemcpyDeviceToHost));
-
       // For each device, copy t and topk arrays into that device's RunState
       for (int d=0; d<MOE_NGPUS; ++d) {
         HIP_CHECK(hipSetDevice(d));
-        // copy t
-        HIP_CHECK(hipMemcpy(MOE_dev_state[d].t, h_t, H * sizeof(float), hipMemcpyHostToDevice));
-        // copy topk arrays (common to all devices)
-        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_v, s.topk_v, p.experts_per_token*sizeof(float), hipMemcpyDeviceToDevice));
-        HIP_CHECK(hipMemcpy(MOE_dev_state[d].topk_i, s.topk_i, p.experts_per_token*sizeof(int),   hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].t, d, s.t, 0, H * sizeof(float)));
+        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].topk_v, d, s.topk_v, 0, p.experts_per_token * sizeof(float)));
+        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].topk_i, d, s.topk_i, 0, p.experts_per_token * sizeof(int)));
 
         // zero per-device e_agg
         const int BS=256, GS=(H+BS-1)/BS;
         hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, MOE_dev_state[d].e_agg, 0.f, H);
       }
-
-      free(h_t);
 
       // 2) compute experts assigned to each device in parallel (each device processes only its local experts)
       #pragma omp parallel for num_threads(MOE_NGPUS)
@@ -291,8 +278,8 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
 
         // for each selected top-k entry, check whether it belongs to this device's group
         for (int idx=0; idx<p.experts_per_token; ++idx) {
-          int e = s.topk_i[idx];
-          float wexp = s.topk_v[idx];
+          int e = ds.topk_i[idx];
+          float wexp = ds.topk_v[idx];
           if (e < 0) continue;
           int owner = e / MOE_GROUP_SIZE;
           if (owner != d) continue;
@@ -346,6 +333,6 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
 
   // logits = out * x
   gemv_gpu(s.logits, s.x, w.out, H, p.vocab_size);
-  HIP_CHECK(hipDeviceSynchronize());
+  // HIP_CHECK(hipDeviceSynchronize());
   return s.logits;
 }
