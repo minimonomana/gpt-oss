@@ -13,6 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+struct RopeTables {
+    int max_seq;
+    int head_dim;
+    int half;
+
+    float *dcos; // [max_seq, half]
+    float *dsin; // [max_seq, half]
+};
+
 __global__ void k_rope(float *x, const float *cosv, const float *sinv,
                        int n_heads, int head_dim) {
   int h = blockIdx.x;
@@ -36,15 +45,16 @@ static void rope_gpu(float *x, const float *cosv, const float *sinv, int n_heads
   hipLaunchKernelGGL(k_rope, grid, block, 0, 0, x, cosv, sinv, n_heads, head_dim);
 }
 
-// GPU kernel for concentration and inv_freq
-__global__ void k_compute_concentration_and_inv_freq(
-    float base, int head_dim, float scaling_factor, float initial_context_length,
-    float ntk_beta, float ntk_alpha, float *concentration_out, float *inv_freq_out) {
+__global__ void k_compute_cos_sin_combined(int pos, float base, int head_dim,
+                                           float scaling_factor, float initial_context_length,
+                                           float ntk_beta, float ntk_alpha,
+                                           float *cos_out, float *sin_out) {
   int d_half = head_dim / 2;
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  if (i >= d_half) return;
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= d_half) return;
 
-  float freq = powf(base, ((float)(2 * i)) / (float)head_dim);
+  float freq = powf(base, ((float)(2 * j)) / (float)head_dim);
+
   float concentration;
   if (scaling_factor > 1.0f) {
     concentration = 0.1f * logf(scaling_factor) + 1.0f;
@@ -52,52 +62,66 @@ __global__ void k_compute_concentration_and_inv_freq(
     float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
     float interpolation = 1.0f / (scaling_factor * freq);
     float extrapolation = 1.0f / freq;
-    float ramp = ((float)i - low) / (high - low);
-    if (ramp < 0) ramp = 0;
-    if (ramp > 1) ramp = 1;
+    float ramp = ((float)j - low) / (high - low);
+    if (ramp < 0.0f) ramp = 0.0f;
+    if (ramp > 1.0f) ramp = 1.0f;
     float mask = 1.0f - ramp;
-    inv_freq_out[i] = interpolation * (1.0f - mask) + extrapolation * mask;
-    if (i == 0) *concentration_out = concentration;
+    float inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+    float val = (float)pos * inv_freq;
+    cos_out[j] = cosf(val) * concentration;
+    sin_out[j] = sinf(val) * concentration;
   } else {
     concentration = 1.0f;
-    inv_freq_out[i] = 1.0f / freq;
-    if (i == 0) *concentration_out = concentration;
+    float inv_freq = 1.0f / freq;
+    float val = (float)pos * inv_freq;
+    cos_out[j] = cosf(val) * concentration;
+    sin_out[j] = sinf(val) * concentration;
   }
 }
 
-// GPU kernel for cos/sin computation
-__global__ void k_compute_cos_sin(int pos, float concentration, const float *inv_freq, float *cos_out, float *sin_out, int d_half) {
-  int j = threadIdx.x + blockIdx.x * blockDim.x;
-  if (j >= d_half) return;
-  float val = (float)pos * inv_freq[j];
-  cos_out[j] = cosf(val) * concentration;
-  sin_out[j] = sinf(val) * concentration;
+static void compute_cos_sin_gpu(int pos, float base, int head_dim,
+                                         float scaling_factor, float initial_context_length,
+                                         float ntk_beta, float ntk_alpha,
+                                         float *cos_out, float *sin_out) {
+  int d_half = head_dim / 2;
+  const int TPB = 256;
+  int G = (d_half + TPB - 1) / TPB;
+  hipLaunchKernelGGL(k_compute_cos_sin_combined, dim3(G), dim3(TPB), 0, 0,
+                     pos, base, head_dim, scaling_factor, initial_context_length,
+                     ntk_beta, ntk_alpha, cos_out, sin_out);
 }
 
-// GPU wrapper for compute_cos_sin
-void compute_cos_sin_gpu(int pos, float base, int head_dim, float scaling_factor,
-                         float initial_context_length, float ntk_beta, float ntk_alpha,
-                         float *cos_out, float *sin_out) {
-  int d_half = head_dim / 2;
-  float *d_inv_freq, *d_concentration;
-  HIP_CHECK(hipMalloc(&d_inv_freq, d_half * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_concentration, sizeof(float)));
+__global__ void k_precompute_rope(float base, int head_dim,
+                                  float scaling_factor, float initial_context_length,
+                                  float ntk_beta, float ntk_alpha,
+                                  int max_seq,
+                                  float *cos_all, float *sin_all) {
+  int half = head_dim / 2;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)max_seq * half) return;
 
-  // Launch kernel to compute concentration and inv_freq
-  k_compute_concentration_and_inv_freq<<<(d_half+255)/256, 256>>>(
-      base, head_dim, scaling_factor, initial_context_length,
-      ntk_beta, ntk_alpha, d_concentration, d_inv_freq);
-  HIP_CHECK(hipDeviceSynchronize());
+  int pos = idx / half;
+  int j   = idx % half;
 
-  // Copy concentration to host
-  float concentration;
-  HIP_CHECK(hipMemcpy(&concentration, d_concentration, sizeof(float), hipMemcpyDeviceToHost));
+  float freq = powf(base, ((float)(2 * j)) / (float)head_dim);
+  float inv_freq, concentration;
+  if (scaling_factor > 1.0f) {
+    concentration = 0.1f * logf(scaling_factor) + 1.0f;
+    float low = half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(base);
+    float high = half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
+    float interpolation = 1.0f / (scaling_factor * freq);
+    float extrapolation = 1.0f / freq;
+    float ramp = ((float)j - low) / (high - low);
+    if (ramp < 0) ramp = 0;
+    if (ramp > 1) ramp = 1;
+    float mask = 1.0f - ramp;
+    inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+  } else {
+    concentration = 1.0f;
+    inv_freq = 1.0f / freq;
+  }
 
-  // Launch kernel to compute cos/sin
-  k_compute_cos_sin<<<(d_half+255)/256, 256>>>(
-      pos, concentration, d_inv_freq, cos_out, sin_out, d_half);
-  HIP_CHECK(hipDeviceSynchronize());
-
-  HIP_CHECK(hipFree(d_inv_freq));
-  HIP_CHECK(hipFree(d_concentration));
+  float val = (float)pos * inv_freq;
+  cos_all[pos * half + j] = cosf(val) * concentration;
+  sin_all[pos * half + j] = sinf(val) * concentration;
 }
