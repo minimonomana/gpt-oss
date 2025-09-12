@@ -312,3 +312,251 @@ static void gemv_gpu(float *y,              // out: [out_features]
                        W, x, y, K, M, splitK);
   }
 }
+
+// ---------- Mixed-precision GEMV: x (FP32) * W (BF16, packed uint16_t on device) -> y (FP32) ----------
+
+// Wave-per-row kernel but W is BF16 packed as uint16_t
+template<int TILE_K=1024, bool VEC4=true>
+__global__ void k_gemv_wave_row_shared_bf16(__half* __restrict__ W, // [M,K] packed BF16
+                                            const float* __restrict__ x,   // [K] FP32
+                                            float* __restrict__ y,         // [M] FP32
+                                            int K, int M) {
+  extern __shared__ float x_s[]; // double buffer
+  float* x_buf0 = x_s;
+  float* x_buf1 = x_s + TILE_K;
+
+  const unsigned wid   = warp_id();
+  const unsigned lane  = lane_id();
+  const unsigned waves_per_block = blockDim.x / WARP_SIZE;
+
+  const int row = blockIdx.x * waves_per_block + wid;
+  const bool active_row = (row < M);
+
+  const bool smem_aligned16 = (((uintptr_t)x_s & 0xF) == 0);
+
+  int k0 = 0;
+  {
+    const int tile_len = dmin(TILE_K, K - k0);
+    if (VEC4 && smem_aligned16 && (((uintptr_t)(x + k0) & 0xF) == 0) && tile_len >= 4) {
+      int vec_elems = tile_len >> 2;
+      const Float4* __restrict__ src4 = reinterpret_cast<const Float4*>(x + k0);
+      Float4* __restrict__ dst4 = reinterpret_cast<Float4*>(x_buf0);
+      for (int i = threadIdx.x; i < vec_elems; i += blockDim.x) dst4[i] = src4[i];
+      for (int i = (vec_elems<<2) + threadIdx.x; i < tile_len; i += blockDim.x) x_buf0[i] = x[k0 + i];
+    } else {
+      for (int i = threadIdx.x; i < tile_len; i += blockDim.x) x_buf0[i] = x[k0 + i];
+    }
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+  int buf = 0;
+
+  for (; k0 < K; k0 += TILE_K, buf ^= 1) {
+    const int tile_len = dmin(TILE_K, K - k0);
+    float* x_cur = (buf == 0 ? x_buf0 : x_buf1);
+    float* x_nxt = (buf == 0 ? x_buf1 : x_buf0);
+
+    if (active_row) {
+      // W is uint16_t packed BF16; row pointer:
+      __half* __restrict__ wrow = W + (size_t)row * (size_t)K + k0;
+
+      if (VEC4 && smem_aligned16 && (((uintptr_t)wrow & 0xF) == 0) && (((uintptr_t)x_cur & 0xF) == 0) && tile_len >= 4) {
+        int vec_end = (tile_len >> 2) << 2;
+        // process 4-elements at a time
+        for (int jj = lane*4; jj < vec_end; jj += WARP_SIZE*4) {
+          // manual unroll: convert bf16->float, then fmaf
+          float a0 = (float)(wrow[jj+0]);
+          float a1 = (float)(wrow[jj+1]);
+          float a2 = (float)(wrow[jj+2]);
+          float a3 = (float)(wrow[jj+3]);
+          const Float4* __restrict__ x4 = reinterpret_cast<const Float4*>(x_cur + jj);
+          Float4 b = *x4;
+          Float4 a = {a0, a1, a2, a3};
+          acc = fmaf(a.x, b.x, acc);
+          acc = fmaf(a.y, b.y, acc);
+          acc = fmaf(a.z, b.z, acc);
+          acc = fmaf(a.w, b.w, acc);
+          // acc = fmaf(a0, x_cur[jj+0], acc);
+          // acc = fmaf(a1, x_cur[jj+1], acc);
+          // acc = fmaf(a2, x_cur[jj+2], acc);
+          // acc = fmaf(a3, x_cur[jj+3], acc);
+        }
+        for (int jj = ((vec_end) + lane); jj < tile_len; jj += WARP_SIZE) {
+          float a = (float)(wrow[jj]);
+          acc = fmaf(a, x_cur[jj], acc);
+        }
+      } else {
+        #pragma unroll 4
+        for (int jj = lane; jj < tile_len; jj += WARP_SIZE) {
+          float a = (float)(wrow[jj]);
+          acc = fmaf(a, x_cur[jj], acc);
+        }
+      }
+    }
+
+    int next_k0 = k0 + TILE_K;
+    if (next_k0 < K) {
+      const int next_len = dmin(TILE_K, K - next_k0);
+      if (VEC4 && smem_aligned16 && (((uintptr_t)(x + next_k0) & 0xF) == 0) && next_len >= 4) {
+        int vec_elems = next_len >> 2;
+        const Float4* __restrict__ src4 = reinterpret_cast<const Float4*>(x + next_k0);
+        Float4* __restrict__ dst4 = reinterpret_cast<Float4*>(x_nxt);
+        for (int i = threadIdx.x; i < vec_elems; i += blockDim.x) dst4[i] = src4[i];
+        for (int i = (vec_elems<<2) + threadIdx.x; i < next_len; i += blockDim.x) x_nxt[i] = x[next_k0 + i];
+      } else {
+        for (int i = threadIdx.x; i < next_len; i += blockDim.x) x_nxt[i] = x[next_k0 + i];
+      }
+    }
+
+    __syncthreads();
+  }
+
+  float sum = warp_reduce_sum(acc);
+  if (lane == 0 && active_row) {
+    // accumulate (same as normal kernel)
+    atomicAdd(&y[row], sum);
+    // y[row] = sum;
+  }
+}
+
+// Split-K version (atomicAdd) for BF16 - similar idea
+template<int TILE_K=1024, bool VEC4=true>
+__global__ void k_gemv_wave_row_shared_splitK_bf16(__half* __restrict__ W,
+                                                  const float* __restrict__ x,
+                                                  float* __restrict__ y,
+                                                  int K, int M, int splitK) {
+  extern __shared__ float x_s[];
+  float* x_buf0 = x_s;
+  float* x_buf1 = x_s + TILE_K;
+
+  const unsigned wid   = warp_id();
+  const unsigned lane  = lane_id();
+  const unsigned waves_per_block = blockDim.x / WARP_SIZE;
+
+  const int row = blockIdx.x * waves_per_block + wid;
+  const bool active_row = (row < M);
+
+  const int part   = blockIdx.y;           // 0..splitK-1
+  const int span   = dceil_div(K, splitK);
+  const int k_begin = part * span;
+  const int k_end   = dmin(K, k_begin + span);
+
+  if (k_begin >= k_end) return;
+
+  const bool smem_aligned16 = (((uintptr_t)x_s & 0xF) == 0);
+
+  int k0 = k_begin;
+  {
+    const int tile_len = dmin(TILE_K, k_end - k0);
+    if (VEC4 && smem_aligned16 && (((uintptr_t)(x + k0) & 0xF) == 0) && tile_len >= 4) {
+      int vec_elems = tile_len >> 2;
+      const Float4* __restrict__ src4 = reinterpret_cast<const Float4*>(x + k0);
+      Float4* __restrict__ dst4 = reinterpret_cast<Float4*>(x_buf0);
+      for (int i = threadIdx.x; i < vec_elems; i += blockDim.x) dst4[i] = src4[i];
+      for (int i = (vec_elems<<2) + threadIdx.x; i < tile_len; i += blockDim.x) x_buf0[i] = x[k0 + i];
+    } else {
+      for (int i = threadIdx.x; i < tile_len; i += blockDim.x) x_buf0[i] = x[k0 + i];
+    }
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+  int buf = 0;
+
+  for (; k0 < k_end; k0 += TILE_K, buf ^= 1) {
+    const int tile_len = dmin(TILE_K, k_end - k0);
+    float* x_cur = (buf == 0 ? x_buf0 : x_buf1);
+    float* x_nxt = (buf == 0 ? x_buf1 : x_buf0);
+
+    if (active_row) {
+      const __half* __restrict__ wrow = W + (size_t)row * (size_t)K + k0;
+
+      if (VEC4 && smem_aligned16 && (((uintptr_t)wrow & 0xF) == 0) && (((uintptr_t)x_cur & 0xF) == 0) && tile_len >= 4) {
+        int vec_end = (tile_len >> 2) << 2;
+        for (int jj = lane*4; jj < vec_end; jj += WARP_SIZE*4) {
+          float a0 = (float)(wrow[jj+0]);
+          float a1 = (float)(wrow[jj+1]);
+          float a2 = (float)(wrow[jj+2]);
+          float a3 = (float)(wrow[jj+3]);
+          const Float4* __restrict__ x4 = reinterpret_cast<const Float4*>(x_cur + jj);
+          Float4 b = *x4;
+          Float4 a = {a0, a1, a2, a3};
+          acc = fmaf(a.x, b.x, acc);
+          acc = fmaf(a.y, b.y, acc);
+          acc = fmaf(a.z, b.z, acc);
+          acc = fmaf(a.w, b.w, acc);
+          // acc = fmaf(a0, x_cur[jj+0], acc);
+          // acc = fmaf(a1, x_cur[jj+1], acc);
+          // acc = fmaf(a2, x_cur[jj+2], acc);
+          // acc = fmaf(a3, x_cur[jj+3], acc);
+        }
+        for (int jj = ((vec_end) + lane); jj < tile_len; jj += WARP_SIZE) {
+          float a = (float)(wrow[jj]);
+          acc = fmaf(a, x_cur[jj], acc);
+        }
+      } else {
+        #pragma unroll 4
+        for (int jj = lane; jj < tile_len; jj += WARP_SIZE) {
+          float a = (float)(wrow[jj]);
+          acc = fmaf(a, x_cur[jj], acc);
+        }
+      }
+    }
+
+    int next_k0 = k0 + TILE_K;
+    if (next_k0 < k_end) {
+      const int next_len = dmin(TILE_K, k_end - next_k0);
+      if (VEC4 && smem_aligned16 && (((uintptr_t)(x + next_k0) & 0xF) == 0) && next_len >= 4) {
+        int vec_elems = next_len >> 2;
+        const Float4* __restrict__ src4 = reinterpret_cast<const Float4*>(x + next_k0);
+        Float4* __restrict__ dst4 = reinterpret_cast<Float4*>(x_nxt);
+        for (int i = threadIdx.x; i < vec_elems; i += blockDim.x) dst4[i] = src4[i];
+        for (int i = (vec_elems<<2) + threadIdx.x; i < next_len; i += blockDim.x) x_nxt[i] = x[next_k0 + i];
+      } else {
+        for (int i = threadIdx.x; i < next_len; i += blockDim.x) x_nxt[i] = x[next_k0 + i];
+      }
+    }
+
+    __syncthreads();
+  }
+
+  float sum = warp_reduce_sum(acc);
+  if (lane == 0 && active_row) atomicAdd(&y[row], sum);
+}
+
+// Launcher for BF16 mixed GEMV: similar heuristics to gemv_gpu
+static void gemv_fp16_weights(float *y,             // out: [M]
+                                 const float *x,       // in: [K]
+                                 __half *W_fp16,// weights BF16 (packed) [M,K] row-major
+                                 int in_features,      // K
+                                 int out_features) {   // M
+  const int K = in_features;
+  const int M = out_features;
+
+  constexpr int TILE_K = 2048;
+  const int waves_per_block = 4;
+  const int WARP_AMD = 64;
+  const dim3 block(waves_per_block * WARP_AMD, 1, 1);
+  size_t shmem_bytes = 2ULL * TILE_K * sizeof(float);
+  // const __half *W_bf16 = reinterpret_cast<const __half*>(W_fp16);
+  hipMemsetAsync(y, 0, (size_t)M * sizeof(float), 0);
+
+  int splitK = 1;
+  if      (K >= 65536) splitK = 8;
+  else if (K >= 32768) splitK = 4;
+  else if (K >= 16384) splitK = 2;
+
+  if (splitK == 1) {
+    const dim3 grid((M + waves_per_block - 1) / waves_per_block, 1, 1);
+    hipLaunchKernelGGL((k_gemv_wave_row_shared_bf16<TILE_K, true>),
+                       grid, block, shmem_bytes, 0,
+                       W_fp16, x, y, K, M);
+  } else {
+    // hipMemset(y, 0, (size_t)M * sizeof(float));
+    const dim3 grid((M + waves_per_block - 1) / waves_per_block, splitK, 1);
+    hipLaunchKernelGGL((k_gemv_wave_row_shared_splitK_bf16<TILE_K, true>),
+                       grid, block, shmem_bytes, 0,
+                       W_fp16, x, y, K, M, splitK);
+  }
+}

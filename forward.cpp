@@ -22,15 +22,8 @@
 #include "hip/swiglu.cpp"
 #include "hip/axpy.cpp"
 
-extern int MOE_NGPUS;
-extern int MOE_GROUP_SIZE;
-extern float **MOE_dev_w_mlp1;
-extern float **MOE_dev_w_mlp2;
-extern float **MOE_dev_b_mlp1;
-extern float **MOE_dev_b_mlp2;
-extern RunState *MOE_dev_state;
-extern float **MOE_partial_on_dev0;
 extern RopeTables g_rope_tables;
+extern __half *d_w_mlp1_fp16;
 
 #define HIP_CHECK(cmd) do { \
   hipError_t e = (cmd);     \
@@ -133,7 +126,6 @@ void topk_gpu(float *topk_values, int *topk_indices, const float *router_score, 
 }
 
 static float* forward_gpu(Transformer *T, int token, int pos) {
-  hipSetDevice(0);
   const Config &p = T->config;
   const TransformerWeights &w = T->weights;
   RunState &s = T->state;
@@ -223,106 +215,46 @@ static float* forward_gpu(Transformer *T, int token, int pos) {
       hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, s.e_agg, 0.f, H);
     }
 
-    if (MOE_NGPUS <= 1) {
-      // single-device path (original)
-      for (int idx=0; idx<p.experts_per_token; ++idx) {
-        int e = s.topk_i[idx];
-        float wexp = s.topk_v[idx];
+    // For each selected expert e:
+    for (int idx=0; idx<p.experts_per_token; ++idx) {
+      int e = s.topk_i[idx];
+      float wexp = s.topk_v[idx];
+      if (e < 0) continue;
 
-        const float *W1 = w.w_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
-        const float *B1 = w.b_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim);
-        gemv_gpu(s.mlp1_out, s.t, W1, H, 2*p.intermediate_dim);
-        add_bias_gpu(s.mlp1_out, B1, 2*p.intermediate_dim);
+      // MLP1: mlp1_out = W_mlp1[l,e] * t + b_mlp1[l,e] → size 2*intermediate
+      // const float *W1 = w.w_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
+      // const void *W_mlp1_fp16 = (w.w_mlp1) + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim) * H;
+      // const float *B1 = w.b_mlp1 + (size_t)(l*p.n_experts + e) * (2*p.intermediate_dim);
+      // // gemv_gpu(s.mlp1_out, s.t, W1, H, 2*p.intermediate_dim);
+      // gemv_fp16_weights(s.mlp1_out, s.t, W_mlp1_fp16, H, 2 * p.intermediate_dim);
+      // add_bias_gpu(s.mlp1_out, B1, 2*p.intermediate_dim);
 
-        const int BS = 256, GS = (p.intermediate_dim + BS - 1) / BS;
-        hipLaunchKernelGGL(split_gate_up, dim3(GS), dim3(BS), 0, 0,
-                          s.mlp1_out, s.gate, s.up, p.intermediate_dim);
+      // const __half *w_mlp1_half = (const __half *)( (const void*) d_w_mlp1_fp16 );
+      size_t expert_index = (size_t)l * (size_t)p.n_experts + (size_t)e;
+      __half *W1_fp16 = d_w_mlp1_fp16 + expert_index * ( (size_t)2 * (size_t)p.intermediate_dim * (size_t)H );
 
-        swiglu_gpu(s.gate, s.up, s.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
+      gemv_fp16_weights(s.mlp1_out, s.t, W1_fp16, H, 2 * p.intermediate_dim);
 
-        const float *W2 = w.w_mlp2 + (size_t)(l*p.n_experts + e) * H * p.intermediate_dim;
-        const float *B2 = w.b_mlp2 + (size_t)(l*p.n_experts + e) * H;
-        gemv_gpu(s.tb2, s.gate_up, W2, p.intermediate_dim, H);
-        add_bias_gpu(s.tb2, B2, H);
+      const float *B1 = w.b_mlp1 + (size_t)expert_index * (2 * p.intermediate_dim);
+      add_bias_gpu(s.mlp1_out, B1, 2 * p.intermediate_dim);
 
-        axpy_gpu(s.e_agg, s.tb2, wexp, H);
-      }
-    } else {
-      // multi-device expert-parallel path:
-      // For each device, copy t and topk arrays into that device's RunState
-      for (int d=0; d<MOE_NGPUS; ++d) {
-        HIP_CHECK(hipSetDevice(d));
-        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].t, d, s.t, 0, H * sizeof(float)));
-        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].topk_v, d, s.topk_v, 0, p.experts_per_token * sizeof(float)));
-        HIP_CHECK(hipMemcpyPeer(MOE_dev_state[d].topk_i, d, s.topk_i, 0, p.experts_per_token * sizeof(int)));
+      // split into gate/up (strided memcopy on device is okay via kernels, but here do 2 gemv-free copies)
+      const int BS = 256, GS = (p.intermediate_dim + BS - 1) / BS;
+      hipLaunchKernelGGL(split_gate_up, dim3(GS), dim3(BS), 0, 0,
+                        s.mlp1_out, s.gate, s.up, p.intermediate_dim);
 
-        // zero per-device e_agg
-        const int BS=256, GS=(H+BS-1)/BS;
-        hipLaunchKernelGGL(k_set, dim3(GS), dim3(BS), 0, 0, MOE_dev_state[d].e_agg, 0.f, H);
-      }
+      // SwiGLU + clamp → gate_up
+      swiglu_gpu(s.gate, s.up, s.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
 
-      // 2) compute experts assigned to each device in parallel (each device processes only its local experts)
-      #pragma omp parallel for num_threads(MOE_NGPUS)
-      for (int d=0; d<MOE_NGPUS; ++d) {
-        HIP_CHECK(hipSetDevice(d));
-        RunState &ds = MOE_dev_state[d];
+      // MLP2: tb2 = W_mlp2[l,e] * gate_up + b_mlp2[l,e] → size hidden
+      const float *W2 = w.w_mlp2 + (size_t)(l*p.n_experts + e) * H * p.intermediate_dim;
+      const float *B2 = w.b_mlp2 + (size_t)(l*p.n_experts + e) * H;
+      gemv_gpu(s.tb2, s.gate_up, W2, p.intermediate_dim, H);
+      add_bias_gpu(s.tb2, B2, H);
 
-        // local group base index
-        int group_base = d * MOE_GROUP_SIZE;
-        size_t mlp1_per = (size_t)2 * p.intermediate_dim * H;
-        size_t mlp2_per = (size_t)H * p.intermediate_dim;
-        size_t dev_mlp1_layer_stride = (size_t)MOE_GROUP_SIZE * mlp1_per;
-        size_t dev_mlp2_layer_stride = (size_t)MOE_GROUP_SIZE * mlp2_per;
-        size_t dev_b1_layer_stride   = (size_t)MOE_GROUP_SIZE * (2 * p.intermediate_dim);
-        size_t dev_b2_layer_stride   = (size_t)MOE_GROUP_SIZE * H;
-
-        // for each selected top-k entry, check whether it belongs to this device's group
-        for (int idx=0; idx<p.experts_per_token; ++idx) {
-          int e = ds.topk_i[idx];
-          float wexp = ds.topk_v[idx];
-          if (e < 0) continue;
-          int owner = e / MOE_GROUP_SIZE;
-          if (owner != d) continue;
-          int local_idx = e - group_base;
-          // pointers into device's shard
-          const float *W1_local = MOE_dev_w_mlp1[d] + (size_t)l * dev_mlp1_layer_stride + (size_t)local_idx * mlp1_per;
-          const float *B1_local = MOE_dev_b_mlp1[d] + (size_t)l * dev_b1_layer_stride + (size_t)local_idx * (2 * p.intermediate_dim);
-          // mlp1: mlp1_out = W1 * ds.t + b1
-          gemv_gpu(ds.mlp1_out, ds.t, W1_local, H, 2 * p.intermediate_dim);
-          add_bias_gpu(ds.mlp1_out, B1_local, 2 * p.intermediate_dim);
-
-          // split
-          const int BS = 256, GS = (p.intermediate_dim + BS - 1) / BS;
-          hipLaunchKernelGGL(split_gate_up, dim3(GS), dim3(BS), 0, 0,
-                            ds.mlp1_out, ds.gate, ds.up, p.intermediate_dim);
-
-          // SwiGLU
-          swiglu_gpu(ds.gate, ds.up, ds.gate_up, p.intermediate_dim, 1.702f, p.swiglu_limit);
-
-          // mlp2
-          const float *W2_local = MOE_dev_w_mlp2[d] + (size_t)l * dev_mlp2_layer_stride + (size_t)local_idx * mlp2_per;
-          const float *B2_local = MOE_dev_b_mlp2[d] + (size_t)l * dev_b2_layer_stride + (size_t)local_idx * H;
-          gemv_gpu(ds.tb2, ds.gate_up, W2_local, p.intermediate_dim, H);
-          add_bias_gpu(ds.tb2, B2_local, H);
-
-          // accumulate into local device e_agg
-          axpy_gpu(ds.e_agg, ds.tb2, wexp, H);
-        } // end idx loop
-
-        // after device computed its local e_agg, copy partial e_agg to device 0 partial buffer
-        // copy device d: ds.e_agg --> device 0: MOE_partial_on_dev0[d]
-        HIP_CHECK( hipMemcpyPeer(MOE_partial_on_dev0[d], 0, ds.e_agg, d, H * sizeof(float)) );
-      } // end parallel for
-
-      // 3) reduce partials on device 0: s.e_agg = sum_{d} partial_d
-      // zero s.e_agg first (already zeroed above), now accumulate per-device
-      for (int d=0; d<MOE_NGPUS; ++d) {
-        // elementwise add MOE_partial_on_dev0[d] into s.e_agg on device 0
-        HIP_CHECK(hipSetDevice(0));
-        // use axpy kernel to do s.e_agg += partial
-        axpy_gpu(s.e_agg, MOE_partial_on_dev0[d], 1.0f, H);
-      }
-    } // end multi-gpu MoE
+      // e_agg += tb2 * wexp
+      axpy_gpu(s.e_agg, s.tb2, wexp, H);
+    }
 
     // residual: x += e_agg
     axpy_gpu(s.x, s.e_agg, 1.0f, H);
